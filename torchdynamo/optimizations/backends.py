@@ -14,6 +14,9 @@ import torchdynamo.convert_frame
 from torchdynamo.optimizations.subgraph import SubGraph
 from torchdynamo.utils import identity
 
+import torch_mlir
+import iree_torch
+
 log = logging.getLogger(__name__)
 BACKENDS = dict()
 _NP_DTYPE = {
@@ -51,6 +54,34 @@ def create_backend(fn):
 
     BACKENDS[fn.__name__] = inner
     return inner
+
+
+@create_backend
+def torch_mlir_backend(subgraph):
+    assert isinstance(subgraph.model, torch.fx.GraphModule), "Model must be an FX GraphModule."
+
+    def _unwrap_single_tuple_return(fx_g: torch.fx.GraphModule):
+        """Replace tuple with tuple element in functions that return one-element tuples."""
+
+        for node in fx_g.graph.nodes:
+            if node.op == "output":
+                assert len(node.args) == 1, "Output node must have a single argument"
+                node_arg = node.args[0]
+                if isinstance(node_arg, tuple) and len(node_arg) == 1:
+                    node.args = (node_arg[0],)
+        fx_g.graph.lint()
+        fx_g.recompile()
+        return fx_g
+
+    fx_graph = _unwrap_single_tuple_return(subgraph.model)
+    ts_graph = torch.jit.script(fx_graph)
+    linalg_module = torch_mlir.compile(ts_graph, subgraph.example_inputs,
+                                       output_type=torch_mlir.OutputType.LINALG_ON_TENSORS)
+    compiled_module = iree_torch.compile_to_vmfb(linalg_module)
+    loaded_module = iree_torch.load_vmfb(compiled_module)
+    def forward(*inputs):
+        return (loaded_module.forward(*inputs),)
+    return forward
 
 
 @create_backend
